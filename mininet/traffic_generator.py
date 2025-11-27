@@ -11,8 +11,8 @@ from mininet.log import setLogLevel, info
 # --- CẤU HÌNH HỆ THỐNG ---
 CONTROLLER_IP = '127.0.0.1'
 CONTROLLER_PORT = 6633
-TOTAL_DURATION = 300   # Tăng lên 300s (5 phút) để thu thập đủ data
-POLLING_INTERVAL = 2   
+TOTAL_DURATION = 1200  # 20 phút - Đủ dài cho bài toán Prediction
+POLLING_INTERVAL = 3   # Tăng nhẹ lên 3s để file CSV không bị quá nặng
 
 # --- CẤU HÌNH MỞ RỘNG ---
 NUM_PATHS = 5          
@@ -50,54 +50,64 @@ class TrafficGenerator:
     def generate(self, duration=TOTAL_DURATION):
         info(f"*** Bắt đầu sinh traffic trong {duration}s...\n")
         
-        # --- CẤU HÌNH TRỌNG SỐ (WEIGHTS) ĐỂ CÂN BẰNG DATA ---
-        # Ưu tiên Video/VoIP vì Web thường sinh ra nhiều mẫu hơn dù ít request
+        # --- CẤU HÌNH TRỌNG SỐ TỐI ƯU CHO 1200s ---
         traffic_types = ['video', 'voip', 'web', 'background']
-        # Tỷ lệ: 35% Video, 35% VoIP, 15% Web, 15% Background
-        weights = [0.35, 0.35, 0.15, 0.15] 
+        # Giảm Web xuống 0.1 vì TCP sinh log gấp đôi/ba UDP
+        # Giữ Background 0.1 là đủ để nhận diện nhiễu
+        weights = [0.4, 0.4, 0.1, 0.1] 
 
         for t in range(duration):
-            info(f"--- Cycle {t}/{duration} ---\n")
+            # In log mỗi 10 chu kỳ cho đỡ rối mắt
+            if t % 10 == 0:
+                info(f"--- Cycle {t}/{duration} ---\n")
+                
             for src in self.src_hosts:
-                # Giảm tỷ lệ nghỉ ngơi xuống 10% để sinh nhiều data hơn
                 if random.random() < 0.1: continue
 
                 target = random.choice(self.dst_hosts)
                 
-                # Biến thiên băng thông
-                bw_pattern = abs(15 * math.sin(t / 10.0 + random.random())) + 5 
-                noise = random.uniform(-3, 3)
-                current_bw = max(1, bw_pattern + noise)
-
-                # Chọn loại traffic dựa trên trọng số
+                # Biến thiên băng thông nền tảng
+                bw_pattern = abs(15 * math.sin(t / 20.0 + random.random())) + 5 
+                
                 traffic_type = random.choices(traffic_types, weights=weights, k=1)[0]
                 
+                # Burst Traffic
+                is_burst = False
                 if random.random() < 0.05:
-                    current_bw += 25
+                    is_burst = True
                     info(f"   [!!! BURST] {src.name} -> {target.name}\n")
 
-                self._send_traffic(src, target, traffic_type, current_bw)
+                self._send_traffic(src, target, traffic_type, bw_pattern, is_burst)
 
             time.sleep(POLLING_INTERVAL)
 
-    def _send_traffic(self, src, dst, traffic_type, bandwidth):
+    def _send_traffic(self, src, dst, traffic_type, bw_pattern, is_burst):
         target_ip = dst.IP()
-        # Chỉnh lại tham số iperf
+        
+        # --- CẤU HÌNH KÍCH THƯỚC GÓI TIN ĐA DẠNG ---
+        
         if traffic_type == 'video':
-            bw_target = bandwidth * 1.2
-            # Video: UDP port 5001
-            cmd = f'iperf -c {target_ip} -u -b {bw_target}M -t {POLLING_INTERVAL} -p 5001 &'
+            # Video: Gói to, băng thông lớn
+            pkt_len = random.randint(1000, 1460)
+            bw_target = bw_pattern * 1.2
+            if is_burst: bw_target += 20
+            cmd = f'iperf -c {target_ip} -u -b {bw_target:.2f}M -l {pkt_len} -t {POLLING_INTERVAL} -p 5001 &'
+            
         elif traffic_type == 'voip':
-            bw_target = 0.5 + (bandwidth * 0.05)
-            # VoIP: UDP port 5002
-            cmd = f'iperf -c {target_ip} -u -b {bw_target}M -t {POLLING_INTERVAL} -p 5002 &'
+            # VoIP: Gói nhỏ, băng thông thấp ổn định
+            pkt_len = random.randint(64, 160)
+            bw_target = 0.1 + random.uniform(0, 0.2)
+            cmd = f'iperf -c {target_ip} -u -b {bw_target:.2f}M -l {pkt_len} -t {POLLING_INTERVAL} -p 5002 &'
+            
         elif traffic_type == 'web':
-            # Web: TCP port 80
+            # Web: TCP (tự động MSS)
             cmd = f'iperf -c {target_ip} -t {POLLING_INTERVAL} -p 80 &'
+            
         else: 
-            # Background: UDP port 5003
-            bw_target = bandwidth * 0.5
-            cmd = f'iperf -c {target_ip} -u -b {bw_target}M -t {POLLING_INTERVAL} -p 5003 &'
+            # Background: Gói trung bình
+            pkt_len = random.randint(300, 800)
+            bw_target = bw_pattern * 0.5
+            cmd = f'iperf -c {target_ip} -u -b {bw_target:.2f}M -l {pkt_len} -t {POLLING_INTERVAL} -p 5003 &'
         
         src.cmd(cmd)
 
@@ -110,17 +120,15 @@ def run():
     try:
         net.start()
         
-        # --- BẬT STP ĐỂ THU THẬP DỮ LIỆU AN TOÀN ---
         info("*** Enabling STP on all switches to prevent Loops...\n")
         for s in net.switches:
             s.cmd(f'ovs-vsctl set Bridge {s.name} protocols=OpenFlow13')
             s.cmd(f'ovs-vsctl set Bridge {s.name} stp_enable=true')
         
-        info("*** Waiting 45s for STP convergence...\n")
-        time.sleep(45)
+        info("*** Waiting 40s for STP convergence...\n")
+        time.sleep(40)
         
-        # info("*** Pinging all to learn MAC addresses...\n")
-        # net.pingAll()
+        # Bỏ PingAll
         
         info(f"*** Starting iperf servers...\n")
         dst_hosts = [net.get(f'h_dst_{i}') for i in range(1, NUM_SERVERS + 1)]
