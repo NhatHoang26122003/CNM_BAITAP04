@@ -1,0 +1,35 @@
+h_src_1 ping -c 3 h_dst_1
+
+===
+Test nhận diện VIDEO (Gói to, Port 5001):
+h_src_1 iperf -c 10.0.0.11 -u -b 10M -l 1400 -p 5001 -t 10
+
+==
+Test nhận diện VOIP (Gói nhỏ, Port 5002):
+h_src_2 iperf -c 10.0.0.12 -u -b 0.5M -l 100 -p 5002 -t 10
+
+===
+Test nhận diện WEB (TCP, Port 80):
+h_src_3 iperf -c 10.0.0.13 -p 80 -t 10
+
+====
+KỊCH BẢN 2: KIỂM TRA CHỐNG NHIỄU (QoS ISOLATION)
+
+h_src_4 iperf -c 10.0.0.14 -u -b 15M -l 500 -p 5003 -t 30 &
+ngay lap tuc
+h_src_1 iperf -c 10.0.0.14 -u -b 10M -l 1400 -p 5001 -t 15
+
+====
+KỊCH BẢN 3: KIỂM TRA CÂN BẰNG TẢI (AI LOAD BALANCING)
+
+h_src_1 iperf -c 10.0.0.11 -u -b 25M -l 1400 -p 5001 -t 40 &
+h_src_2 iperf -c 10.0.0.11 -u -b 25M -l 1400 -p 5001 -t 15
+
+=====
+
+KỊCH BẢN 4: HỖN HỢP (STRESS TEST)
+
+h_src_1 iperf -c 10.0.0.11 -u -b 15M -l 1400 -p 5001 -t 20 &
+h_src_2 iperf -c 10.0.0.12 -u -b 0.5M -l 100 -p 5002 -t 20 &
+h_src_3 iperf -c 10.0.0.13 -p 80 -t 20 &
+h_src_4 iperf -c 10.0.0.14 -u -b 5M -l 500 -p 5003 -t 20 &
