@@ -5,7 +5,6 @@ import warnings
 # --- TẮT CẢNH BÁO ---
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
-# Tắt các cảnh báo không cần thiết
 warnings.filterwarnings("ignore")
 # --------------------
 
@@ -47,7 +46,7 @@ class SmartController(simple_switch_13.SimpleSwitch13):
         
         self.seq_length = 10
         self.pred_type = 'LSTM'
-        self.flow_stats = {}      
+        self.flow_stats = {}       
         self.path_history = {}    
         self.uplink_ports = [5, 6, 7, 8, 9] 
         self.path_loads = {port: 0.0 for port in self.uplink_ports}
@@ -96,7 +95,6 @@ class SmartController(simple_switch_13.SimpleSwitch13):
                 self.datapaths[datapath.id] = datapath
         elif ev.state == DEAD_DISPATCHER:
             if datapath.id in self.datapaths:
-                # print(f"   [DISCONNECT] Switch {datapath.id} left.")
                 del self.datapaths[datapath.id]
 
     def _monitor(self):
@@ -151,8 +149,6 @@ class SmartController(simple_switch_13.SimpleSwitch13):
             
             if mbps > 1.0: high_load = True
 
-        # CHỈ IN 1 DÒNG DUY NHẤT thay vì 5 dòng
-        # Và chỉ in khi tổng tải mạng có hoạt động đáng kể (>1Mbps ở bất kỳ đường nào)
         if high_load:
             print(f"   [AI PREDICT] Load Distribution: {' | '.join(log_msg)}")
 
@@ -193,19 +189,16 @@ class SmartController(simple_switch_13.SimpleSwitch13):
                 packet_rate = packet_count / stat.duration_sec
                 ip_proto = stat.match.get('ip_proto', 17)
                 
-                # --- FIX: Dùng DataFrame để có tên cột, tránh warning ---
                 features_df = pd.DataFrame([[ip_proto, packet_count, byte_count, 
                                              stat.duration_sec, byte_rate, packet_rate, avg_packet_size]], 
                                            columns=FEATURE_NAMES)
                 
                 if self.cls_model:
                     # --- AI CLASSIFIER ---
-                    # Scale bằng DataFrame đã có tên cột
                     features_scaled = self.cls_scaler.transform(features_df)
                     pred_idx = self.cls_model.predict(features_scaled)[0]
                     label = CLASS_MAP.get(pred_idx, "unknown")
                     
-                    # Log phân loại (In tất cả các loại quan trọng)
                     if label in ['video', 'voip'] or byte_rate > 100000:
                         print(f"   [AI CLASSIFIER] Flow {label.upper()} detected (Size: {avg_packet_size:.0f} bytes)")
 
@@ -221,10 +214,24 @@ class SmartController(simple_switch_13.SimpleSwitch13):
                     if curr_port != 0 and curr_port != new_out_port:
                         print(f"   >>> [AI-REROUTE] Optimizing {label.upper()}: Switch to Path {new_out_port-4}")
                         
-                        reward = 1000 / (self.path_loads.get(new_out_port, 0) + 1.0)
-                        self._update_q_table(pred_idx, best_path_idx, reward)
-                        self.mod_flow(ev.msg.datapath, stat.match, new_out_port)
+                        # --- CÔNG THỨC REWARD MỚI (ĐƠN GIẢN) ---
+                        # 1. Điểm cơ bản dựa trên tải của đường đích (càng trống càng tốt)
+                        base_reward = 1000 / (self.path_loads.get(new_out_port, 0) + 1.0)
+                        
+                        # 2. Nhân hệ số ưu tiên (Multiplier)
+                        multiplier = 1.0
+                        if label == 'video':
+                            multiplier = 2.0   # Video x2
+                        elif label == 'voip':
+                            multiplier = 1.5   # VoIP x1.5
+                        elif label == 'web':
+                            multiplier = 1.0   # Web x1
+                        
+                        final_reward = base_reward * multiplier
+                        # --------------------------------------
 
+                        self._update_q_table(pred_idx, best_path_idx, final_reward)
+                        self.mod_flow(ev.msg.datapath, stat.match, new_out_port)
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
@@ -239,24 +246,46 @@ class SmartController(simple_switch_13.SimpleSwitch13):
         
         if eth.ethertype in [ether_types.ETH_TYPE_LLDP, 34525, ether_types.ETH_TYPE_ARP]: return
 
-        if eth.ethertype == ether_types.ETH_TYPE_IP:
-            self.mac_to_port.setdefault(dpid, {})
-            self.mac_to_port[dpid][eth.src] = in_port
-            
-            if dpid == 1 and in_port <= 4:
-                ip = pkt.get_protocol(ipv4.ipv4)
-                print(f"[NEW FLOW] {ip.src} -> {ip.dst}")
-                
-                rand_path = random.randint(0, 4)
-                out_port = self.uplink_ports[rand_path]
+        if dpid == 1:
+            # TRƯỜNG HỢP 1: Gói tin từ Host gửi lên (Cổng 1-4)
+            if in_port <= 4:
+                # Học địa chỉ MAC
+                self.mac_to_port.setdefault(dpid, {})
+                self.mac_to_port[dpid][eth.src] = in_port
+
+                if eth.ethertype == ether_types.ETH_TYPE_IP:
+                    ip = pkt.get_protocol(ipv4.ipv4)
+                    print(f"[NEW FLOW] {ip.src} -> {ip.dst}")
+                    
+                    # AI chọn đường ngẫu nhiên ban đầu (Exploration)
+                    rand_path = random.randint(0, len(self.uplink_ports)-1)
+                    out_port = self.uplink_ports[rand_path]
+                    
+                    actions = [parser.OFPActionOutput(out_port)]
+                    match = parser.OFPMatch(in_port=in_port, eth_type=ether_types.ETH_TYPE_IP,
+                                            ipv4_src=ip.src, ipv4_dst=ip.dst, ip_proto=ip.proto)
+                    
+                    self.add_flow(datapath, 10, match, actions, msg.buffer_id, idle_timeout=10)
+                    return
+        
+            else:
+                if eth.dst in self.mac_to_port.get(dpid, {}):
+                    out_port = self.mac_to_port[dpid][eth.dst]
+                else:
+                    # Fallback an toàn cho topo này: H1 luôn ở port 1
+                    out_port = 1 
                 
                 actions = [parser.OFPActionOutput(out_port)]
-                match = parser.OFPMatch(
-                    in_port=in_port, eth_type=ether_types.ETH_TYPE_IP,
-                    ipv4_src=ip.src, ipv4_dst=ip.dst, ip_proto=ip.proto)
-                
-                self.add_flow(datapath, 10, match, actions, msg.buffer_id, idle_timeout=5)
+                data = None
+                if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+                    data = msg.data
+                out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                          in_port=in_port, actions=actions, data=data)
+                datapath.send_msg(out)
                 return
+
+        self.mac_to_port.setdefault(dpid, {})
+        self.mac_to_port[dpid][eth.src] = in_port
 
         if eth.dst in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][eth.dst]
